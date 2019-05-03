@@ -68,7 +68,7 @@ describe TransformationMapping do
 
         it 'if VM has an invalid name in openstack' do
           vm_for_openstack.storages << FactoryBot.create(:storage)
-          name = "\u1F4A9 poo"
+          name = 7.chr # beep, non-printable
           FactoryBot.create(:vm_vmware, :name => name, :ems_cluster => src_openstack, :ext_management_system => ems_openstack)
           result = openstack_mapping.search_vms_and_validate(['name' => name])
           expect(result['invalid'].first.reason).to eq(TransformationMapping::VmMigrationValidator::VM_UNSUPPORTED_NAME)
