@@ -4,10 +4,22 @@ describe TransformationMapping do
   let(:dst) { FactoryBot.create(:ems_cluster, :ext_management_system => ems) }
   let(:vm)  { FactoryBot.create(:vm_vmware, :ems_cluster => src) }
 
+  let(:ems_openstack) { FactoryBot.create(:ems_openstack) }
+  let(:src_openstack) { FactoryBot.create(:ems_cluster) }
+  let(:dst_openstack) { FactoryBot.create(:ems_cluster, :ext_management_system => ems_openstack) }
+  let(:vm_for_openstack) { FactoryBot.create(:vm_vmware, :ems_cluster => src_openstack) }
+
   let(:mapping) do
     FactoryBot.create(
       :transformation_mapping,
       :transformation_mapping_items => [TransformationMappingItem.new(:source => src, :destination => dst)]
+    )
+  end
+
+  let(:openstack_mapping) do
+    FactoryBot.create(
+      :transformation_mapping,
+      :transformation_mapping_items => [TransformationMappingItem.new(:source => src_openstack, :destination => dst_openstack)]
     )
   end
 
@@ -47,6 +59,21 @@ describe TransformationMapping do
 
     context 'with VM list' do
       context 'returns invalid vms' do
+        it 'if VM has an invalid name in rhevm' do
+          name = ' not allowed'
+          FactoryBot.create(:vm_vmware, :name => name, :ems_cluster => src, :ext_management_system => ems)
+          result = mapping.search_vms_and_validate(['name' => name])
+          expect(result['invalid'].first.reason).to eq(TransformationMapping::VmMigrationValidator::VM_UNSUPPORTED_NAME)
+        end
+
+        it 'if VM has an invalid name in openstack' do
+          vm_for_openstack.storages << FactoryBot.create(:storage)
+          name = "\u1F4A9 poo"
+          FactoryBot.create(:vm_vmware, :name => name, :ems_cluster => src_openstack, :ext_management_system => ems_openstack)
+          result = openstack_mapping.search_vms_and_validate(['name' => name])
+          expect(result['invalid'].first.reason).to eq(TransformationMapping::VmMigrationValidator::VM_UNSUPPORTED_NAME)
+        end
+
         it 'if VM does not exist' do
           result = mapping.search_vms_and_validate(['name' => 'vm1'])
           expect(result['invalid'].first.reason).to eq(TransformationMapping::VmMigrationValidator::VM_NOT_EXIST)
