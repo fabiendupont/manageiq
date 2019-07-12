@@ -7,7 +7,7 @@ class InfraConversionJob < Job
     super(name, options)
   end
 
-  #
+  # TODO: UPDATE THE DIAGRAM
   # State-transition diagram:
   #                              :poll_conversion                         :poll_post_stage
   #    *                          /-------------\                        /---------------\
@@ -33,58 +33,42 @@ class InfraConversionJob < Job
     self.state ||= 'initialize'
 
     {
-      :initializing     => {'initialize'       => 'waiting_to_start'},
-      :start            => {'waiting_to_start' => 'running'},
-      :poll_conversion  => {'running'          => 'running'},
-      :start_post_stage => {'running'          => 'post_conversion'},
-      :poll_post_stage  => {'post_conversion'  => 'post_conversion'},
-      :finish           => {'*'                => 'finished'},
-      :abort_job        => {'*'                => 'aborting'},
-      :cancel           => {'*'                => 'canceling'},
-      :error            => {'*'                => '*'}
+      :initializing   => { 'initialize'  => 'waiting_to_start' },
+      :collapse_snapshots => { 'waiting_to_start' => 'collapsing_snapshots' },
+      :warm_migration_sync => {
+        'collapsing_snapshots' => 'warm_migration_syncing',
+        'warm_migration_syncing' => 'warm_migration_syncing'
+       },
+      :run_pre_migration_playbook => {
+        'collapsing_snapshots' => 'running_pre_migration_playbook',
+        'warm_migration_syncing' => 'running_pre_migration_playbook',
+        'running_pre_migration_playbook' => 'running_pre_migration_playbook'
+      },
+      'shutdown' => {
+        'running_pre_migration_playbook' => 'shutting_down',
+        'shutting_down' => 'shutting_down'
+      },
+      'cold_migration_convert' => {
+        'shutting_down' => 'cold_migration_syncing',
+        'cold_migration_syncing' => 'cold_migration_syncing'
+      },
+      'warm_migration_finalize' => {
+        'shutting_down' => 'warm_migration_finalizing',
+        'warm_migration_finalizing' => 'warm_migration_finalizing'
+      },
+      'restore_attributes' => {
+        'cold_migration_syncing' => 'restoring_attributes',
+        'warm_migration_finalizing' => 'restoring_attributes'
+      },
+      'apply_right_size' => { 'restoring_attributes' => 'applying_right_size' },
+      'power_on' => { 'applying_right_size' => 'powering_on' },
+      'run_post_migration_playbook' => { 'powering_on' => 'running_post_migration_playbook' }
+      'finish' => { '*' => 'finished' },
+      'abort_job' => { '*' => 'aborting' },
+      'cancel' => { '*' => 'canceling' },
+      'error' => { '*' => '*' }
     }
   end
-
-#  def load_transitions
-#    self.state ||= 'initialize'
-#
-#    {
-#      :initializing   => { 'initialize'  => 'waiting_to_start' },
-#      :collapse_snapshots => { 'waiting_to_start' => 'collapsing_snapshots' },
-#      :warm_migration_sync => {
-#        'collapsing_snapshots' => 'warm_migration_syncing',
-#        'warm_migration_syncing' => 'warm_migration_syncing'
-#       },
-#      :run_pre_migration_playbook => {
-#        'collapsing_snapshots' => 'running_pre_migration_playbook',
-#        'warm_migration_syncing' => 'running_pre_migration_playbook',
-#        'running_pre_migration_playbook' => 'running_pre_migration_playbook'
-#      },
-#      'shutdown' => {
-#        'running_pre_migration_playbook' => 'shutting_down',
-#        'shutting_down' => 'shutting_down'
-#      },
-#      'cold_migration_convert' => {
-#        'shutting_down' => 'cold_migration_syncing',
-#        'cold_migration_syncing' => 'cold_migration_syncing'
-#      },
-#      'warm_migration_finalize' => {
-#        'shutting_down' => 'warm_migration_finalizing',
-#        'warm_migration_finalizing' => 'warm_migration_finalizing'
-#      },
-#      'restore_attributes' => {
-#        'cold_migration_syncing' => 'restoring_attributes',
-#        'warm_migration_finalizing' => 'restoring_attributes'
-#      },
-#      'apply_right_size' => { 'restoring_attributes' => 'applying_right_size' },
-#      'power_on' => { 'applying_right_size' => 'powering_on' },
-#      'run_post_migration_playbook' => { 'powering_on' => 'running_post_migration_playbook' }
-#      'finish' => { '*' => 'finished' },
-#      'abort_job' => { '*' => 'aborting' },
-#      'cancel' => { '*' => 'canceling' },
-#      'error' => { '*' => '*' }
-#    }
-#  end
 
   def migration_task
     @migration_task ||= target_entity
