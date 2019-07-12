@@ -45,19 +45,72 @@ class InfraConversionJob < Job
     }
   end
 
+#  def load_transitions
+#    self.state ||= 'initialize'
+#
+#    {
+#      :initializing   => { 'initialize'  => 'waiting_to_start' },
+#      :collapse_snapshots => { 'waiting_to_start' => 'collapsing_snapshots' },
+#      :warm_migration_sync => {
+#        'collapsing_snapshots' => 'warm_migration_syncing',
+#        'warm_migration_syncing' => 'warm_migration_syncing'
+#       },
+#      :run_pre_migration_playbook => {
+#        'collapsing_snapshots' => 'running_pre_migration_playbook',
+#        'warm_migration_syncing' => 'running_pre_migration_playbook',
+#        'running_pre_migration_playbook' => 'running_pre_migration_playbook'
+#      },
+#      'shutdown' => {
+#        'running_pre_migration_playbook' => 'shutting_down',
+#        'shutting_down' => 'shutting_down'
+#      },
+#      'cold_migration_convert' => {
+#        'shutting_down' => 'cold_migration_syncing',
+#        'cold_migration_syncing' => 'cold_migration_syncing'
+#      },
+#      'warm_migration_finalize' => {
+#        'shutting_down' => 'warm_migration_finalizing',
+#        'warm_migration_finalizing' => 'warm_migration_finalizing'
+#      },
+#      'restore_attributes' => {
+#        'cold_migration_syncing' => 'restoring_attributes',
+#        'warm_migration_finalizing' => 'restoring_attributes'
+#      },
+#      'apply_right_size' => { 'restoring_attributes' => 'applying_right_size' },
+#      'power_on' => { 'applying_right_size' => 'powering_on' },
+#      'run_post_migration_playbook' => { 'powering_on' => 'running_post_migration_playbook' }
+#      'finish' => { '*' => 'finished' },
+#      'abort_job' => { '*' => 'aborting' },
+#      'cancel' => { '*' => 'canceling' },
+#      'error' => { '*' => '*' }
+#    }
+#  end
+
   def migration_task
     @migration_task ||= target_entity
     # valid states: %w(migrated pending finished active queued)
   end
 
-  def start
-    # TransformationCleanup 3 things:
-    #  - kill v2v: ignored because no converion_host is there yet in the original automate-based logic
-    #  - power_on: ignored
-    #  - check_power_on: ignore
+  def warm_migration?
+    migration_task.options[:warm_migration_requested]
+  end
 
+  def vm
+    @vm || migration_task.source
+  end
+
+  def initializing
     migration_task.preflight_check
     _log.info(prep_message("Preflight check passed, task.state=#{migration_task.state}. continue ..."))
+    queue_signal(:start)
+  rescue => error
+    message = prep_message("Preflight check has failed: #{message}")
+    _log.info(message)
+    abort_conversion(message, 'error')
+  end
+
+  def start
+    _log.info(prep_message("ght check passed, task.state=#{migration_task.state}. continue ..."))
     queue_signal(:poll_conversion)
   rescue => error
     message = prep_message("Preflight check has failed: #{error}")
@@ -65,7 +118,139 @@ class InfraConversionJob < Job
     abort_conversion(message, 'error')
   end
 
+  def collapse_snapshots
+    vm.remove_all_napshots unless vm.vendor != 'vmware' or vm.snapshots.empty?
+    signal =  warm_migration? ? :warm_migration_sync : :run_pre_migration_playbook
+    queue_signal(signal)
+  end
+
+  def warm_migration_sync
+    return abort_conversion('Warm migration sync timed out', 'error') if polling_timeout(:warm_migration_sync)
+
+    # If virt-v2v-wrapper has not been launched yet, then launch it
+    unless migration_task.options[:virtv2v_wrapper_started_on]
+      message = 'Virt-v2v-wrapper is not started. Starting it.'
+      _log.info(prep_message(message))
+      migration_task.run_conversion(:warm)
+      return queue_signal(:warm_migration_sync, :deliver_on => Time.now.utc + options[:warm_migration_sync_polling_interval]
+    end
+
+    # If virt-v2v-wrapper has been launch, but has not created its state file yet, then retry
+    unless migration_task.options.fetch_path(:virtv2v_wrapper, 'state_file')
+      message = 'Virt-v2v-wrapper state file not available, continuing warm_migration_sync'
+      _log.info(prep_message(message))
+      update_attributes(:message => message)
+      return queue_signal(:warm_migration_sync, :deliver_on => Time.now.utc + options[:warm_migration_sync_polling_interval]
+    end
+
+    # Retrieve the conversion state
+    begin
+      migration_task.get_conversion_state
+    rescue ==> error
+      _log.log_backtrace(error)
+      return abort_conversion("Warm migration sync error: #{error.message}", 'error')
+    end
+
+    # Logging and displaying the status of warm migration
+    warm_migration_sync_status = migration_task.options[:warm_migration_sync_status]
+    message = "warm_migration_sync_status=#{warm_migration_sync_status}"
+    _log.info(prep_message(message)
+    update_attributes(:message => message)
+
+    # Update message if warm migration sync has failed
+    if warm_migration_sync_status == 'failed'
+      message = migration_task.options[:warm_migration_sync_message]
+      return abort_conversion(prep_message("Warm migration sync failed: #{message}"))
+    end
+
+    # If the cutover date/time has been reached, move to the next state
+    if migration_task.optons[:warm_migration_finalize_datetime] < Time.now.utc
+      _log.info("Warm migration finalization time has been reached, continuing migration process")
+      return queue_signal(:run_pre_migration_playbook)
+    end
+
+    # Otherwise, retry
+    queue_signal(:warm_migration_sync, :deliver_on => Time.now.utc + options[:warm_migration_sync_polling_interval]
+  end
+
+  def run_pre_migration_playbook
+    service_request_id = migration_task.options[:pre_ansible_playbook_service_request_id]
+
+    if service_request_id.nil?
+      return queue_signal(:shutdown) if vm.ipaddresses.empty?
+      service_template = migration_task.pre_ansible_playbook_service_template
+      service_dialog_options = { :hosts => vm.ipaddresses.first }
+      service_request = create_service_provision_request(service_template, service_dialog_options) # TODO
+      migration_task.options[:pre_ansible_playbook_service_request_id] = service_request.id
+      return queue_signal(:run_pre_migration_playbook, :deliver_on => Time.now.utc + options[:migration_playbook_polling_interval])
+    end
+
+    service_request = MiqRequest.find_by(service_request_id)
+
+    playbook_status = migration_task.options[:pre_migration_playbook_status] || {}
+    playbook_status[:job_state] = service_request.state
+    playbook_status[:job_status] = service_request.status
+    playbooks_status[:job_id] ||= service_request.miq_request_tasks.first.destination.service_resources.first.resource.id
+    migration_task.options[:pre_migration_playbook_status] = playbook_status
+
+    return abort_conversion('Premigration playbook failed', 'error') if playbook_status[:job_status] == 'Error'
+    return queue_signal(:shutdown) if playbook_status[:job_state] == 'finished'
+    queue_signal(:run_pre_migration_playbook, :deliver_on => Time.now.utc + options[:migration_playbook_polling_interval]
+  end
+
+  def shutdown
+    if vm.power_state == 'off'
+      signal = warm_migration? ? :warm_migration_finalize : :cold_migration_convert
+      return queue_signal(signal)
+    end
+
+    if polling_timeout(:shutdown)
+      vm.stop
+    elsif migration_task.options[:shutdown_requested_time].nil?
+      vm.shutdown_guest
+      migration_task.options[:shutdown_requested_time] = Time.now.utc
+    end
+
+    queue_signal(:shutdown, :deliver_on => Time.now.utc + options[:shutdown_polling_interval]
+  end
+
+  def warm_migration_finalize
+    return abort_conversion('Warm migration finalize timed out', 'error') if polling_timeout(:warm_migration_finalize)
+
+    unless migration_task.options[:warm_migration_finalize_started_on]
+      migration_task.finalize_warm_migration
+      return queue_signal(:warm_migration_finalize, :deliver_on => Time.now.utc + options[:warm_migration_finalize_polling_internal]
+    end
+    
+    # Retrieve the conversion state
+    begin
+      migration_task.get_conversion_state
+    rescue ==> error
+      _log.log_backtrace(error)
+      return abort_conversion("Warm migration sync error: #{error.message}", 'error')
+    end
+
+    # Logging and displaying the status of warm migration
+    warm_migration_finalize_status = migration_task.options[:warm_migration_finalize_status]
+    message = "warm_migration_finalize_status=#{warm_migration_finalize_status}"
+    _log.info(prep_message(message)
+    update_attributes(:message => message)
+
+    # Update message if warm migration sync has failed
+    if warm_migration_finalize_status == 'failed'
+      message = migration_task.options[:warm_migration_finalize_message]
+      return abort_conversion(prep_message("Warm migration finalize failed: #{message}"))
+    end
+
+    # Otherwise, retry
+    queue_signal(:warm_migration_finaize, :deliver_on => Time.now.utc + options[:warm_migration_finalize_polling_interval]
+  end
+
   def abort_conversion(message, status)
+    # TransformationCleanup 3 things:
+    #  - kill v2v: ignored because no converion_host is there yet in the original automate-based logic
+    #  - power_on: ignored
+    #  - check_power_on: ignore
     migration_task.cancel
     queue_signal(:abort_job, message, status)
   end
@@ -77,7 +262,7 @@ class InfraConversionJob < Job
     context[count] > options[max]
   end
 
-  def poll_conversion
+  def cold_migration_convert
     return abort_conversion("Polling times out", 'error') if polling_timeout(:poll_conversion)
 
     message = "Getting conversion state"
@@ -87,7 +272,7 @@ class InfraConversionJob < Job
       message = "Virt v2v state file not available, continuing poll_conversion"
       _log.info(prep_message(message))
       update_attributes(:message => message)
-      return queue_signal(:poll_conversion, :deliver_on => Time.now.utc + options[:conversion_polling_interval])
+      return queue_signal(:cold_migration_convert, :deliver_on => Time.now.utc + options[:conversion_polling_interval])
     end
 
     begin
@@ -104,7 +289,7 @@ class InfraConversionJob < Job
 
     case v2v_status
     when 'active'
-      queue_signal(:poll_conversion, :deliver_on => Time.now.utc + options[:conversion_polling_interval])
+      queue_signal(:cold_migration_convert, :deliver_on => Time.now.utc + options[:conversion_polling_interval])
     when 'failed'
       message = "disk conversion failed"
       abort_conversion(prep_message(message), 'error')
