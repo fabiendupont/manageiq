@@ -33,7 +33,11 @@ class InfraConversionJob < Job
     self.state ||= 'initialize'
 
     {
-      :initializing   => { 'initialize'  => 'waiting_to_start' },
+      :initializing   => { 'initialize'  => 'waiting_for_conversion_host' },
+      :wait_for_conversion_host => {
+        'waiting_to_start' => 'waiting_for_conversion_host',
+        'waiting_for_conversion_host' => 'waiting_for_conversion_host'
+      },
       :collapse_snapshots => { 'waiting_to_start' => 'collapsing_snapshots' },
       :warm_migration_sync => {
         'collapsing_snapshots' => 'warm_migration_syncing',
@@ -86,15 +90,16 @@ class InfraConversionJob < Job
   def initializing
     migration_task.preflight_check
     _log.info(prep_message("Preflight check passed, task.state=#{migration_task.state}. continue ..."))
-    queue_signal(:start)
+    queue_signal(:wait_for_conversion_host)
   rescue => error
     message = prep_message("Preflight check has failed: #{message}")
     _log.info(message)
     abort_conversion(message, 'error')
   end
 
-  def start
-    _log.info(prep_message("ght check passed, task.state=#{migration_task.state}. continue ..."))
+  def wait_for_conversion_host
+    return queue_signal(:wait_for_conversion_host)
+    _log.info(prep_message("Conversion host '#{migration_task.conversion_host.name}' has been allocated. continue ..."))
     queue_signal(:poll_conversion)
   rescue => error
     message = prep_message("Preflight check has failed: #{error}")
@@ -103,8 +108,15 @@ class InfraConversionJob < Job
   end
 
   def collapse_snapshots
+    update_migration_task('Collapsing snapshot')
     vm.remove_all_napshots unless vm.vendor != 'vmware' or vm.snapshots.empty?
-    signal =  warm_migration? ? :warm_migration_sync : :run_pre_migration_playbook
+    if warm_migration?
+      signal =  :warm_migration_sync
+    else
+      signal = :run_pre_migration_playbook
+      message = 'Collapsing snapshots'
+    end
+    update_migration_task(message, status)
     queue_signal(signal)
   end
 
@@ -307,6 +319,10 @@ class InfraConversionJob < Job
     else
       queue_signal(:poll_post_stage, :deliver_on => Time.now.utc + options[:conversion_polling_interval])
     end
+  end
+
+  def update_migration_task
+    
   end
 
   def queue_signal(*args, deliver_on: nil)
